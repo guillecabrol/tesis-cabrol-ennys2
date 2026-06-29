@@ -284,7 +284,8 @@ cramer_v_ponderado <- function(var, design) {
 vars_cramer <- c(
   "Region", "Sexo", "Edad_f",
   vars_fca,
-  "Sedentarismo_t", "ActFisica_t",
+  "Sedentarismo_t", "ActFisica_t", "Sueno_t",
+  "Cumple_OMS_ActFisica", "Cumple_OMS_Sueño",
   "Hace_ActFisica_Escuela", "Escuela_Provee_Alimento", "Escuela_Tiene_Kiosco",
   "Compro_En_Kiosco", "Kiosco_Compro_No_Recomendados", "Kiosco_Compro_Recomendados",
   "Asiste_Escuela", "Cobertura_Salud", "Nivel_Educacion_Jefe", "Quintil_Ingreso",
