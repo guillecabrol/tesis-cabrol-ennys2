@@ -11,6 +11,7 @@ library(broom)
 library(mice)
 library(pROC)          # AUC no ponderado
 library(WeightedROC)   # AUC ponderado por diseño
+library(car)           # VIF (GVIF para factores)
 
 options(survey.lonely.psu = "adjust")
 
@@ -91,7 +92,6 @@ datos <- datos %>%
     Sedentarismo_t = relevel(a_terciles(HorasPorDia_Sedentarismo), ref = "Bajo"),
     ActFisica_t    = relevel(a_terciles(Horas_PorDia_ActFisica),   ref = "Bajo"),
     Sueño_t        = relevel(a_terciles(HorasPorDia_Sueño),        ref = "Bajo")
-    # Para la hipótesis en U del sueño: relevel(..., ref = "Medio")
   )
 
 cat("\n=== Cortes de terciles (percentiles 33 / 67) ===\n")
@@ -152,6 +152,16 @@ vars_mult <- c("Edad", "Sexo", "Region",
                "Frec_Frutas", "Frec_Verduras", "Frec_Bebidas_Azucaradas")
 
 formula_mult <- as.formula(paste("y ~", paste(vars_mult, collapse = " + ")))
+
+# ──────────────────── VIF ───────────────────────────────
+# Se ajusta un glm ordinario (sin ponderadores) para calcular el VIF.
+# Los ponderadores no afectan la estructura de colinealidad entre
+# predictores, por lo que el VIF del glm es válido para este fin.
+glm_para_vif <- glm(formula_mult, data = datos, family = binomial())
+vif_mult <- vif(glm_para_vif)
+cat("\n=== VIF del modelo múltiple ===\n")
+print(vif_mult)
+
 modelo_mult  <- svyglm(formula_mult, design = diseno, family = quasibinomial())
 
 res_mult <- tidy(modelo_mult, exponentiate = TRUE, conf.int = TRUE) %>%
@@ -201,16 +211,16 @@ df_forest <- tidy(modelo_mult, exponentiate = TRUE, conf.int = TRUE) %>%
     etiqueta = factor(etiqueta_txt, levels = rev(unique(etiqueta_txt))),
     sig = case_when(
       p.value < 0.05 ~ "Significativa (p < 0.05)",
-      p.value < 0.10 ~ "Borderline (0.05\u20130.10)",
+      p.value < 0.10 ~ "Marginal (0.05\u20130.10)",
       TRUE           ~ "No significativa (p \u2265 0.10)"
     ),
     sig = factor(sig, levels = c("Significativa (p < 0.05)",
-                                 "Borderline (0.05\u20130.10)",
+                                 "Marginal (0.05\u20130.10)",
                                  "No significativa (p \u2265 0.10)"))
   )
 
 colores <- c("Significativa (p < 0.05)"        = "#185FA5",
-             "Borderline (0.05\u20130.10)"      = "#BA7517",
+             "Marginal (0.05\u20130.10)"      = "#BA7517",
              "No significativa (p \u2265 0.10)" = "#888780")
 
 p_forest <- ggplot(df_forest, aes(x = estimate, y = etiqueta, color = sig)) +
@@ -236,6 +246,7 @@ p_forest <- ggplot(df_forest, aes(x = estimate, y = etiqueta, color = sig)) +
   )
 
 print(p_forest)
+#ggsave("forest.pdf", plot = p_forest, width = 8, height = 4.5)
 
 # ============================================================
 # EVALUACIÓN DEL MODELO MÚLTIPLE
@@ -282,8 +293,7 @@ res_cv <- map_dfr(1:k, function(i) {
 roc_cv  <- roc(res_cv$obs, res_cv$prob, quiet = TRUE)
 ci_cv   <- ci.auc(roc_cv)
 peso_cv <- res_cv$peso / mean(res_cv$peso)
-wauc_cv <- WeightedAUC(WeightedROC(guess = res_cv$prob, label = res_cv$obs,
-                                   weight = peso_cv))
+wauc_cv <- WeightedAUC(WeightedROC(guess = res_cv$prob, label = res_cv$obs, weight = peso_cv))
 
 auc_por_fold <- res_cv %>%
   group_by(fold) %>%
@@ -297,37 +307,106 @@ cat(sprintf("Por fold \u2014 media %.4f | SD %.4f | rango %.4f\u2013%.4f\n",
             mean(auc_por_fold$auc), sd(auc_por_fold$auc),
             min(auc_por_fold$auc), max(auc_por_fold$auc)))
 
-# ── 3. UMBRAL ÓPTIMO (Youden) Y MÉTRICAS ────────────────────
-youden <- coords(roc_cv, x = "best", best.method = "youden",
-                 ret = c("threshold", "sensitivity", "specificity"))
-cat("\n=== Punto óptimo de Youden (CV) ===\n")
-print(youden)
+# ── 3. UMBRALES Y MÉTRICAS (sobre predicciones OOF de CV) ────
+metricas_umbral <- function(prob, obs, umbral, w = NULL) {
+  pred <- as.integer(prob >= umbral)
+  if (is.null(w)) w <- rep(1, length(obs))
+  vp <- sum(w * (pred==1 & obs==1)); fp <- sum(w * (pred==1 & obs==0))
+  fn <- sum(w * (pred==0 & obs==1)); vn <- sum(w * (pred==0 & obs==0))
+  sens <- vp/(vp+fn); esp <- vn/(vn+fp)
+  prec <- if ((vp+fp) > 0) vp/(vp+fp) else NA_real_
+  acc  <- (vp+vn)/(vp+fp+fn+vn)
+  f2   <- if (!is.na(prec) && (4*prec+sens) > 0) 5*prec*sens/(4*prec+sens) else NA_real_
+  c(accuracy=acc, sensibilidad=sens, precision=prec, especificidad=esp, F2=f2)
+}
 
-umbral <- 0.33  # <- fijalo a mano si querés
+# (a) Youden — umbral de REFERENCIA
+umbral_youden <- as.numeric(
+  coords(roc_cv, x="best", best.method="youden", ret="threshold", transpose=FALSE)$threshold
+)
 
-pred <- ifelse(res_cv$prob >= umbral, 1, 0)
-obs  <- res_cv$obs
-beta <- 2
+# (b) Umbral ADOPTADO: mayor umbral con sensibilidad >= 0.80
+target_sens <- 0.80
+co   <- coords(roc_cv, x="all", ret=c("threshold","sensitivity","specificity"), transpose=FALSE)
+cand <- co[co$sensitivity >= target_sens & is.finite(co$threshold), ]
+umbral_adoptado <- max(cand$threshold)
 
-# Métricas no ponderadas
-vp <- sum(pred == 1 & obs == 1)
-fp <- sum(pred == 1 & obs == 0)
-fn <- sum(pred == 0 & obs == 1)
-prec <- vp / (vp + fp)
-rec  <- vp / (vp + fn)                       # sensibilidad
-f2   <- (1 + beta^2) * prec * rec / (beta^2 * prec + rec)
+cat("\n=== Comparación de umbrales (CV, no ponderado) ===\n")
+comp_umbrales <- rbind(
+  Youden          = c(umbral=umbral_youden,   metricas_umbral(res_cv$prob, res_cv$obs, umbral_youden)),
+  Adoptado_sens80 = c(umbral=umbral_adoptado, metricas_umbral(res_cv$prob, res_cv$obs, umbral_adoptado))
+)
+print(round(comp_umbrales, 4))
 
-# Métricas ponderadas
-w   <- res_cv$peso / mean(res_cv$peso)
-vpw <- sum(w * (pred == 1 & obs == 1))
-fpw <- sum(w * (pred == 1 & obs == 0))
-fnw <- sum(w * (pred == 0 & obs == 1))
-precw <- vpw / (vpw + fpw)
-recw  <- vpw / (vpw + fnw)
-f2w   <- (1 + beta^2) * precw * recw / (beta^2 * precw + recw)
+# ── Métricas en el umbral ADOPTADO (no ponderadas y ponderadas) ──
+w_cv  <- res_cv$peso / mean(res_cv$peso)
+m_unw <- metricas_umbral(res_cv$prob, res_cv$obs, umbral_adoptado)
+m_w   <- metricas_umbral(res_cv$prob, res_cv$obs, umbral_adoptado, w = w_cv)
 
-cat("\n=== Métricas en el umbral seleccionado ===\n")
-cat(sprintf("Umbral:              %.3f\n", umbral))
-cat(sprintf("Sensibilidad:        %.4f   (ponderada %.4f)\n", rec, recw))
-cat(sprintf("F2-score (beta = 2): %.4f   (ponderado %.4f)\n", f2, f2w))
+tabla_metricas <- rbind(`No ponderada` = m_unw, `Ponderada` = m_w)
+cat("\n=== Métricas en el umbral adoptado ===\n")
+cat(sprintf("Umbral adoptado: %.3f  (Youden de referencia: %.3f)\n", umbral_adoptado, umbral_youden))
 
+# ── 4. MÉTRICAS POR FOLD: ENTRENAMIENTO vs Evaluación + BOXPLOTS ──
+# Se reajusta el modelo en el train de cada fold y se evalúa en train y test.
+# Métricas por fold SIN ponderar (diagnóstico de sobreajuste, comparable con RF/XGBoost).
+res_ft <- map_dfr(1:k, function(i) {
+  tr <- datos[folds != i, ]; te <- datos[folds == i, ]
+  dis_tr <- svydesign(ids=~1, strata=~Estrato, weights=~Ponderador, data=tr, nest=TRUE)
+  m <- tryCatch(svyglm(formula_mult, design=dis_tr, family=quasibinomial()),
+                error=function(e) NULL)
+  if (is.null(m)) return(NULL)
+  ptr <- as.numeric(predict(m, newdata=tr, type="response"))
+  pte <- as.numeric(predict(m, newdata=te, type="response"))
+  atr <- as.numeric(auc(roc(tr$y, ptr, quiet=TRUE)))
+  ate <- as.numeric(auc(roc(te$y, pte, quiet=TRUE)))
+  mtr <- metricas_umbral(ptr, tr$y, umbral_adoptado)
+  mte <- metricas_umbral(pte, te$y, umbral_adoptado)
+  bind_rows(
+    tibble(fold=i, particion="Entrenamiento", metrica=c(names(mtr),"AUC"), valor=c(as.numeric(mtr), atr)),
+    tibble(fold=i, particion="Evaluación",        metrica=c(names(mte),"AUC"), valor=c(as.numeric(mte), ate))
+  )
+})
+
+resumen_ft <- res_ft %>%
+  group_by(particion, metrica) %>%
+  summarise(media=mean(valor, na.rm=TRUE), sd=sd(valor, na.rm=TRUE), .groups="drop") %>%
+  arrange(metrica, particion)
+cat("\n--- Métricas por fold: media ± sd (train vs test) — Reg. logística ---\n")
+print(resumen_ft, n = Inf)
+
+# ────── Boxplots ──────
+orden_m <- c("sensibilidad","precision","F2","accuracy","AUC","especificidad")
+res_ft  <- res_ft %>% mutate(metrica = factor(metrica, levels = orden_m))
+
+# Alto común = el mayor rango entre métricas, con 15% de margen
+span <- res_ft %>%
+  group_by(metrica) %>%
+  summarise(r = max(valor) - min(valor), .groups = "drop") %>%
+  pull(r) %>% max() * 1.15
+
+lims <- res_ft %>%
+  group_by(metrica) %>%
+  summarise(centro = (min(valor) + max(valor)) / 2, .groups = "drop") %>%
+  mutate(lo = pmax(0, centro - span/2), hi = pmin(1, centro + span/2)) %>%
+  pivot_longer(c(lo, hi), values_to = "valor") %>%
+  transmute(metrica, particion = "Entrenamiento", valor)
+
+p_box <- res_ft %>%
+  filter(metrica %in% orden_m) %>%
+  ggplot(aes(x = particion, y = valor, fill = particion)) +
+  geom_boxplot(width = 0.6, alpha = 0.85, outlier.size = 0.8) +
+  geom_blank(data = lims) +                    # fuerza el alto común por panel
+  facet_wrap(~ metrica, nrow = 2, scales = "free_y") +
+  scale_fill_manual(values = c("Entrenamiento" = "#BA7517", "Evaluación" = "#185FA5")) +
+  labs(title = "Distribución de métricas por fold (CV 10) — Regresión logística",
+       subtitle = sprintf("Umbral adoptado = %.3f (sens >= %.2f)", umbral_adoptado, target_sens),
+       x = NULL, y = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position    = "none",
+        plot.title         = element_text(face = "bold", hjust = 0.5),
+        plot.subtitle      = element_text(color = "gray40", hjust = 0.5),
+        strip.text         = element_text(face = "bold"),
+        panel.grid.minor.y = element_line(linewidth = 0.3, color = "gray92"))
+print(p_box)
+#ggsave("boxplot_reglog.pdf", plot = p_box, width = 9, height = 5)
