@@ -15,14 +15,13 @@ library(factoextra)
 # 1. Cargar la base original y completar con NA las celdas vacias
 dataset_original <- read.csv("ENNyS2_encuesta.csv", na.strings = c("", " ", "NA"))
 
-
 # 2. Filtrado del dataset
 dataset <- dataset_original %>%
   
   # 1. FILTRADO DE POBLACIÓN: Me quedo solo con los adolescentes de 13 a 17 años (Cuestionario 3)
   filter(E_CUEST == "13 a 17 años") %>%
   
-  #. Filtro los datos faltantes en la variable respuesta y arreglo algunas edades que estan mal
+  #. Excluyo los datos faltantes en la variable respuesta y arreglo algunas edades que estan mal
   filter(!is.na(IMC_5a17cat_ex)) %>%
   
   mutate(
@@ -32,6 +31,10 @@ dataset <- dataset_original %>%
   mutate(
     SD_MIEMBRO_SORTEADO_SD_4 = ifelse(SD_MIEMBRO_SORTEADO_SD_4 == "12", "13", SD_MIEMBRO_SORTEADO_SD_4)
   ) %>%
+  
+  # 2. Excluyo los adolescentes con delgadez
+  filter(IMC_5a17cat_ex != "Delgadez") %>%
+  filter(IMC_5a17cat != "Delgadez") %>%
   
   # 3. SELECCIÓN DE COLUMNAS
   select(
@@ -124,7 +127,7 @@ dataset <- dataset_original %>%
     
     # Variables de miembros del hogar (para NBI 4 y NBI 5)
     # Edad, asistencia escolar y situación laboral de cada miembro (M01..M15)
-    # + nivel educativo del jefe (M01). Se descartan luego de construir el NBI.
+    # + nivel educativo del jefe (M01). (Se descartan luego de construir el NBI.)
     matches("^M[0-9]{2}_SD_4$"),    # edad de cada miembro
     matches("^M[0-9]{2}_SD_15$"),   # asistencia escolar de cada miembro
     matches("^M[0-9]{2}_SD_19$"),   # ¿trabajó? (ocupado) de cada miembro
@@ -132,11 +135,10 @@ dataset <- dataset_original %>%
     M01_SD_17,                      # ¿completó ese nivel? (jefe)
   ) %>%
   
-  #agrupo a delgadez y peso normal en una categoria "sin exceso de peso" para que me quede binaria el target
   mutate(
     Target_Exceso_Peso = case_when(
       Target_Exceso_Peso == "Exceso de peso" ~ "Exceso de peso",
-      Target_Exceso_Peso %in% c("Delgadez", "Peso normal") ~ "Sin exceso de peso",
+      Target_Exceso_Peso == "Peso normal" ~ "Sin exceso de peso",
       TRUE ~ NA_character_
     )
   ) %>%
@@ -323,8 +325,7 @@ dataset <- dataset %>%
     },
     
     # ---- NBI 5: capacidad de subsistencia reducida ----
-    # (a) 4 o más personas por miembro ocupado  Y
-    # (b) el jefe/a no completó la primaria (criterio amplio, ver metodología)
+    # 4 o más personas por miembro ocupado  Y el jefe/a no completó la primaria
     n_miembros_hogar = rowSums(!is.na(across(matches("^M[0-9]{2}_SD_4$") &
                                                !matches("_SD_4[0-9]")))),
     n_ocupados = rowSums(across(matches("^M[0-9]{2}_SD_19$"),
@@ -355,7 +356,7 @@ dataset <- dataset %>%
     ),
     
     # =============================================================
-    # ÍNDICE DE ENTORNO ESCOLAR OBESOGÉNICO — versión revisada
+    # ÍNDICE DE ENTORNO ESCOLAR OBESOGÉNICO 
     # =============================================================
     
     # ----------------------------------------------------------
@@ -419,8 +420,8 @@ dataset <- dataset %>%
     # ----------------------------------------------------------
     # Categorización con cortes fijos en ±1/3
     #
-    #   Bajo     < -1/3  →  entorno predominantemente protector
-    #   Moderado  [-1/3, +1/3]  →  entorno neutro / mixto
+    #   Bajo     < -1/3  →  entorno protector
+    #   Moderado  [-1/3, +1/3]  →  entorno neutro
     #   Alto     > +1/3  →  entorno predominantemente obesogénico
     # ----------------------------------------------------------
     Indice_Obesogenico_Cat = case_when(
