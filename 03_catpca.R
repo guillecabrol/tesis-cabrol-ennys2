@@ -11,6 +11,7 @@
 
 library(Gifi)
 library(tidyverse)
+library(ggrepel)
 
 
 # ── 2. CARGA DE DATOS ────────────────────────────────────────
@@ -85,9 +86,8 @@ print(summary(catpca))
 
 # ── 5. ¿CUÁNTAS DIMENSIONES RETENER? ─────────────────────────
 # Cada dimensión explica un % de la varianza total.
-# Usamos dos criterios:
-#   - Scree plot: buscamos el "codo" donde la curva se aplana
-#   - Varianza acumulada: cuántas dimensiones llegan a un % razonable
+# Criterio de Kaiser: se conservan las dimensiones con autovalor > 1, es decir, aquellas que
+# sintetizan más varianza que una única variable original estandarizada.
 
 evals <- catpca$evals
 var_explicada <- evals / sum(evals) * 100
@@ -102,20 +102,6 @@ tabla_var <- tibble(
 
 cat("\n=== Varianza explicada por dimensión ===\n")
 print(tabla_var, n = Inf)
-
-# Scree plot
-p_scree <- ggplot(tabla_var[1:5, ], aes(x = Dimension, y = Var_Explicada)) +
-  geom_line(color = "#185FA5", linewidth = 1) +
-  geom_point(color = "#185FA5", size = 3) +
-  labs(title    = "Scree plot \u2014 CATPCA frecuencias de consumo",
-       subtitle = "Buscar el codo donde la curva se aplana",
-       x = "Dimensión", y = "% de varianza explicada") +
-  theme_minimal(base_size = 12) +
-  theme(plot.title = element_text(face = "bold", hjust = 0.5),
-        plot.subtitle = element_text(color = "gray40", hjust = 0.5))
-
-print(p_scree)
-
 
 # ── 6. INTERPRETAR LAS DIMENSIONES (LOADINGS) ────────────────
 # Los "loadings" indican cuánto pesa cada grupo de alimento en
@@ -164,57 +150,3 @@ datos_con_scores <- bind_cols(datos, scores)
 
 # Guardamos el dataset con los scores para el siguiente script
 write.csv(datos_con_scores, "datos_con_scores_catpca.csv", row.names = FALSE)
-
-# ── 8. BIPLOT (individuos + variables en el mismo plano) ─────
-# A diferencia del gráfico de loadings (solo flechas), el biplot
-# superpone los object scores (cada adolescente = un punto) con
-# los loadings (cada alimento = una flecha). Como las dos nubes
-# viven en escalas distintas, se reescalan las flechas para que
-# sean visibles sobre los puntos (factor de escala estándar).
-
-# Individuos (object scores) en las dos primeras dimensiones
-ind <- as.data.frame(catpca$objectscores)[, 1:2]
-names(ind) <- c("D1", "D2")
-
-# Variables (loadings) en las dos primeras dimensiones
-var <- as.data.frame(catpca$loadings)[, 1:2]
-names(var) <- c("D1", "D2")
-var$Alimento <- rownames(catpca$loadings)
-
-# Factor de escala: lleva las flechas al rango de la nube de puntos
-escala <- 0.9 * max(abs(ind)) / max(abs(var[, c("D1", "D2")]))
-
-# % de varianza para rotular los ejes (de la tabla que ya tenés)
-pct1 <- round(var_explicada[1], 1)
-pct2 <- round(var_explicada[2], 1)
-
-# opcional: nombres más legibles, sin guiones bajos
-var$Alimento <- gsub("_", " ", var$Alimento)
-
-p_biplot <- ggplot() +
-  # nube de individuos
-  geom_point(data = ind, aes(D1, D2),
-             color = "gray70", alpha = 0.30, size = 0.8) +
-  geom_hline(yintercept = 0, color = "gray60", linetype = "dashed") +
-  geom_vline(xintercept = 0, color = "gray60", linetype = "dashed") +
-  # flechas de las variables
-  geom_segment(data = var,
-               aes(x = 0, y = 0, xend = D1 * escala, yend = D2 * escala),
-               arrow = arrow(length = unit(0.2, "cm")),
-               color = "#C0392B", linewidth = 0.6) +
-  # etiquetas que se esquivan entre sí (en vez de geom_text)
-  geom_text_repel(data = var,
-                  aes(x = D1 * escala, y = D2 * escala, label = Alimento),
-                  color = "#C0392B", size = 4.5, fontface = "bold",
-                  segment.color = "#C0392B", segment.size = 0.3,
-                  min.segment.length = 0, box.padding = 0.5,
-                  point.padding = 0.3, max.overlaps = Inf, seed = 42) +
-  labs(title    = "Biplot \u2014 CATPCA frecuencias de consumo",
-       subtitle = "Puntos: adolescentes (object scores) | Flechas: alimentos (loadings)",
-       x = paste0("Dimensión 1 (", pct1, "%)"),
-       y = paste0("Dimensión 2 (", pct2, "%)")) +
-  theme_minimal(base_size = 14) +
-  theme(plot.title    = element_text(face = "bold", hjust = 0.5),
-        plot.subtitle = element_text(color = "gray40", hjust = 0.5))
-
-print(p_biplot)
