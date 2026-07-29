@@ -72,13 +72,13 @@ receta <- recipe(Target_bin ~ ., data = df_modelo) %>%
 prep(receta) %>% bake(new_data = NULL) %>% ncol() %>%
   cat("Variables después de dummies:", ., "\n")
 
-# ── 3. MODELO (7 hiperparámetros tuneados) ──────────────────
+# ── 3. MODELO (6 hiperparámetros tuneados; gamma y L1/L2 en default) ──
 xgb_spec <- boost_tree(
   trees          = tune(),
   tree_depth     = tune(),
   learn_rate     = tune(),
   min_n          = tune(),
-  loss_reduction = tune(),
+  loss_reduction = 0,        # fijo: la poda ya la ejercen tree_depth y min_n
   mtry           = tune(),
   sample_size    = tune()
 ) %>%
@@ -97,13 +97,12 @@ n_preds <- prep(receta) %>% bake(new_data = NULL) %>%
 
 set.seed(1213)
 grid_xgb <- grid_space_filling(
-  trees(range          = c(200, 1500)),
-  tree_depth(range     = c(2, 5)),
-  learn_rate(range     = c(-2.3, -1)),    # log10: 0.005 a 0.1
-  min_n(range          = c(10, 50)),
-  loss_reduction(range = c(-5, 0.7)),     # log10
-  mtry(range           = c(round(n_preds * 0.5), n_preds)),
-  sample_size          = sample_prop(c(0.5, 1.0)),
+  trees(range      = c(30, 400)),
+  tree_depth(range = c(1, 4)),          # incluye stumps (depth = 1)
+  learn_rate(range = c(-1.5, -0.5)),    # log10: 0.03 a 0.3
+  min_n(range      = c(10, 60)),
+  mtry(range       = c(round(n_preds * 0.5), n_preds)),
+  sample_size      = sample_prop(c(0.5, 1.0)),
   size = 60
 )
 cat("Combinaciones a explorar:", nrow(grid_xgb), "\n")
@@ -139,35 +138,46 @@ ci_cv_xgb  <- ci.auc(roc_cv_xgb)
 cat(sprintf("\nAUC CV global (OOF): %.4f [IC 95%%: %.4f\u2013%.4f]\n",
             auc_cv_xgb, ci_cv_xgb[1], ci_cv_xgb[3]))
 
-# ── 9. UMBRAL ÓPTIMO (Youden) Y MÉTRICAS ────────────────────
-coords_xgb <- coords(roc_cv_xgb, x = "best", best.method = "youden",
-                     ret = c("threshold", "sensitivity", "specificity"))
-cat("\n--- Umbral óptimo de Youden ---\n"); print(coords_xgb)
+metricas_en_umbral <- function(prob_si, obs, umbral) {
+  pred <- ifelse(prob_si >= umbral, "Si", "No")
+  obs  <- as.character(obs)
+  vp <- sum(pred == "Si" & obs == "Si"); fp <- sum(pred == "Si" & obs == "No")
+  fn <- sum(pred == "No" & obs == "Si"); vn <- sum(pred == "No" & obs == "No")
+  sens <- vp / (vp + fn)
+  esp  <- vn / (vn + fp)
+  prec <- if ((vp + fp) > 0) vp / (vp + fp) else NA_real_
+  acc  <- (vp + vn) / (vp + fp + fn + vn)
+  f2   <- if (!is.na(prec) && (4 * prec + sens) > 0)
+    5 * prec * sens / (4 * prec + sens) else NA_real_
+  c(accuracy = acc, sensibilidad = sens, precision = prec,
+    especificidad = esp, F2 = f2)
+}
 
-umbral <- 0.31
+# ── 9. UMBRALES Y MÉTRICAS (OOF) ────────────────────────────
+# (a) Umbral de Youden (referencia)
+umbral_youden <- as.numeric(
+  coords(roc_cv_xgb, x = "best", best.method = "youden",
+         ret = "threshold", transpose = FALSE)$threshold
+)
 
-pred_binaria <- ifelse(pred_cv_xgb$.pred_Si >= umbral, "Si", "No")
-obs_real     <- as.character(pred_cv_xgb$Target_bin)
+# (b) Umbral ADOPTADO: mayor umbral con sensibilidad >= 0.80
+target_sens <- 0.80
+co   <- coords(roc_cv_xgb, x = "all",
+               ret = c("threshold", "sensitivity", "specificity"),
+               transpose = FALSE)
+cand <- co[co$sensitivity >= target_sens & is.finite(co$threshold), ]
+umbral_sens <- max(cand$threshold)
 
-vp <- sum(pred_binaria == "Si" & obs_real == "Si")
-vn <- sum(pred_binaria == "No" & obs_real == "No")
-fp <- sum(pred_binaria == "Si" & obs_real == "No")
-fn <- sum(pred_binaria == "No" & obs_real == "Si")
+cat(sprintf("\nUmbral Youden (referencia):     %.3f\n", umbral_youden))
 
-precision     <- vp / (vp + fp)
-recall        <- vp / (vp + fn)
-especificidad <- vn / (vn + fp)
-beta <- 2
-f2 <- (1 + beta^2) * precision * recall / ((beta^2 * precision) + recall)
-
-cat("\n========================================\n")
-cat("MÉTRICAS EN EL UMBRAL (XGBoost)\n")
-cat("========================================\n")
-cat(sprintf("Umbral:        %.3f\n", umbral))
-cat(sprintf("Sensibilidad:  %.4f\n", recall))
-cat(sprintf("Especificidad: %.4f\n", especificidad))
-cat(sprintf("F2-score:      %.4f\n", f2))
-cat("========================================\n")
+cat("\n=== Comparación de umbrales (OOF, CV 10) — XGBoost ===\n")
+comp_umbrales <- rbind(
+  Youden           = c(umbral = umbral_youden,
+                       metricas_en_umbral(pred_cv_xgb$.pred_Si, pred_cv_xgb$Target_bin, umbral_youden)),
+  Adoptado_sens80  = c(umbral = umbral_sens,
+                       metricas_en_umbral(pred_cv_xgb$.pred_Si, pred_cv_xgb$Target_bin, umbral_sens))
+)
+print(round(comp_umbrales, 4))
 
 # ── 10. MODELO FINAL (para importancia) ─────────────────────
 wf_final <- finalize_workflow(wf, mejor_params)
@@ -175,23 +185,32 @@ set.seed(1213)
 modelo_final <- fit(wf_final, data = df_modelo)
 xgb_fit <- extract_fit_parsnip(modelo_final)
 
-# ── 11. IMPORTANCIA DE VARIABLES (incluye demográficas) ─────
-# step_dummy crea una columna por categoría, así que aparecen los
-# niveles (p.ej. Sedentarismo_t_Alto, Region_NEA, etc.).
-imp_df <- vi(xgb_fit$fit, scale = TRUE) %>%
-  arrange(Importance) %>%
+# ── 11. IMPORTANCIA DE VARIABLES (agregada a nivel variable) ─────
+# step_dummy crea una columna por categoría; sumamos el gain de todas
+# las dummies de cada variable para obtener su importancia total,
+# comparable con la del RF (una fila por variable).
+vars_orig <- c("Edad", "Sexo", "Region", "Sedentarismo_t", "ActFisica_t",
+               "Frec_Frutas", "Frec_Verduras", "Frec_Bebidas_Azucaradas")
+
+imp_df <- vi(xgb_fit$fit, scale = FALSE) %>%                 # gain crudo (aditivo)
+  mutate(Variable_orig = map_chr(Variable, function(v) {
+    hit <- vars_orig[startsWith(v, vars_orig)]              # qué variable es prefijo del dummy
+    if (length(hit)) hit[which.max(nchar(hit))] else v      # el prefijo más largo
+  })) %>%
+  group_by(Variable_orig) %>%
+  summarise(Importance = sum(Importance), .groups = "drop") %>%
   mutate(
-    Variable = factor(Variable, levels = Variable),
+    Importance = 100 * Importance / max(Importance),
+    Variable   = fct_reorder(Variable_orig, Importance),
     grupo = case_when(
-      str_detect(as.character(Variable),
-                 "Frec_Frutas|Frec_Verduras|Frec_Bebidas_Azucaradas") ~ "Alimentación",
-      str_detect(as.character(Variable),
-                 "Sedentarismo|ActFisica|Sue") ~ "Comportamiento",
+      str_detect(Variable_orig, "Frec_Frutas|Frec_Verduras|Frec_Bebidas_Azucaradas") ~ "Alimentación",
+      str_detect(Variable_orig, "Sedentarismo|ActFisica")                        ~ "Comportamiento",
       TRUE ~ "Demográficas"
     )
   )
+
 cat("\n--- Importancia de variables ---\n")
-print(imp_df %>% arrange(desc(Importance)))
+print(imp_df %>% arrange(desc(Importance)), n = Inf)
 
 colores_imp <- c(
   "Alimentación"   = "#5E8F58",
@@ -215,22 +234,76 @@ p_imp <- ggplot(imp_df, aes(x = Importance, y = Variable, fill = grupo)) +
         panel.grid.minor = element_blank())
 print(p_imp)
 
-# ── 12. CURVA ROC ───────────────────────────────────────────
-p_roc <- ggplot(data.frame(fpr = 1 - roc_cv_xgb$specificities,
-                           tpr = roc_cv_xgb$sensitivities),
-                aes(x = fpr, y = tpr)) +
-  geom_abline(slope = 1, intercept = 0, linetype = "dashed",
-              color = "gray60", linewidth = 0.5) +
-  geom_line(color = "#185FA5", linewidth = 1) +
-  annotate("text", x = 0.65, y = 0.25,
-           label = sprintf("AUC CV = %.3f", auc_cv_xgb),
-           size = 4, color = "#185FA5", fontface = "bold") +
-  scale_x_continuous("1 \u2212 Especificidad", limits = c(0, 1), expand = c(0.01, 0)) +
-  scale_y_continuous("Sensibilidad", limits = c(0, 1), expand = c(0.01, 0)) +
-  labs(title    = "Curva ROC \u2014 XGBoost (CV 10 folds)",
-       subtitle = "Predicciones out-of-fold del mejor modelo") +
+#ggsave("importancia_xgb.pdf", plot = p_imp, width = 9, height = 5)
+
+# ── 12. MÉTRICAS POR FOLD: ENTRENAMIENTO vs EVALUACIÓN + BOXPLOTS ──
+umbral_reporte <- umbral_sens
+
+eval_fold <- function(split) {
+  tr <- analysis(split); te <- assessment(split)
+  mod <- fit(wf_final, data = tr)
+  prob_tr <- predict(mod, tr, type = "prob")$.pred_Si
+  prob_te <- predict(mod, te, type = "prob")$.pred_Si
+  auc_tr <- as.numeric(auc(roc(tr$Target_bin, prob_tr,
+                               levels = c("No","Si"), direction = "<", quiet = TRUE)))
+  auc_te <- as.numeric(auc(roc(te$Target_bin, prob_te,
+                               levels = c("No","Si"), direction = "<", quiet = TRUE)))
+  m_tr <- metricas_en_umbral(prob_tr, tr$Target_bin, umbral_reporte)
+  m_te <- metricas_en_umbral(prob_te, te$Target_bin, umbral_reporte)
+  bind_rows(
+    tibble(particion = "Entrenamiento", metrica = c(names(m_tr), "AUC"),
+           valor = c(as.numeric(m_tr), auc_tr)),
+    tibble(particion = "Evaluación",    metrica = c(names(m_te), "AUC"),
+           valor = c(as.numeric(m_te), auc_te))
+  )
+}
+
+set.seed(1213)
+metricas_folds <- folds_xgb$splits %>%
+  set_names(folds_xgb$id) %>%
+  imap(~ eval_fold(.x) %>% mutate(fold = .y)) %>%
+  bind_rows()
+
+resumen_ft <- metricas_folds %>%
+  group_by(particion, metrica) %>%
+  summarise(media = mean(valor, na.rm = TRUE),
+            sd    = sd(valor,   na.rm = TRUE), .groups = "drop") %>%
+  arrange(metrica, particion)
+cat("\n--- Métricas por fold: media ± sd (train vs test) — XGBoost ---\n")
+print(resumen_ft, n = Inf)
+
+# Boxplots
+orden_m <- c("sensibilidad","precision","F2","accuracy","AUC","especificidad")
+metricas_folds <- metricas_folds %>% mutate(metrica = factor(metrica, levels = orden_m))
+
+span <- metricas_folds %>%
+  group_by(metrica) %>%
+  summarise(r = max(valor) - min(valor), .groups = "drop") %>%
+  pull(r) %>% max() * 1.15
+
+lims <- metricas_folds %>%
+  group_by(metrica) %>%
+  summarise(centro = (min(valor) + max(valor)) / 2, .groups = "drop") %>%
+  mutate(lo = pmax(0, centro - span/2), hi = pmin(1, centro + span/2)) %>%
+  pivot_longer(c(lo, hi), values_to = "valor") %>%
+  transmute(metrica, particion = "Entrenamiento", valor)
+
+p_box <- metricas_folds %>%
+  filter(metrica %in% orden_m) %>%
+  ggplot(aes(x = particion, y = valor, fill = particion)) +
+  geom_boxplot(width = 0.6, alpha = 0.85, outlier.size = 0.8) +
+  geom_blank(data = lims) +
+  facet_wrap(~ metrica, nrow = 2, scales = "free_y") +
+  scale_fill_manual(values = c("Entrenamiento" = "#BA7517", "Evaluación" = "#185FA5")) +
+  labs(title = "Distribución de métricas por fold (CV 10) — XGBoost",
+       subtitle = sprintf("Umbral adoptado = %.3f (sens >= %.2f)", umbral_reporte, target_sens),
+       x = NULL, y = NULL) +
   theme_minimal(base_size = 12) +
-  theme(plot.title = element_text(face = "bold", size = 13, hjust = 0.5),
-        plot.subtitle = element_text(color = "gray40", size = 10, hjust = 0.5),
-        panel.grid.minor = element_blank())
-print(p_roc)
+  theme(legend.position    = "none",
+        plot.title         = element_text(face = "bold", hjust = 0.5),
+        plot.subtitle      = element_text(color = "gray40", hjust = 0.5),
+        strip.text         = element_text(face = "bold"),
+        panel.grid.minor.y = element_line(linewidth = 0.3, color = "gray92"))
+print(p_box)
+
+#ggsave("boxplot_xgb.pdf", plot = p_box, width = 9, height = 5)
