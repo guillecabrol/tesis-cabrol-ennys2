@@ -211,8 +211,8 @@ tabla_var <- function(var, design, data) {
   # Tabla ponderada cruzada (estimación poblacional)
   tw <- svytable(as.formula(paste0("~ ", var, " + Target_bin")), design)
   if (ncol(tw) < 2) return(NULL)
-  # Porcentajes POR FILA (dentro de cada categoría de la variable)
-  pct <- prop.table(tw, margin = 1) * 100
+  # Porcentajes POR COLUMNA (dentro de cada condición de peso)
+  pct <- prop.table(tw, margin = 2) * 100
   # N muestral total por categoría (no ponderado)
   n_cat <- as.numeric(table(data[[var]]))
   names(n_cat) <- names(table(data[[var]]))
@@ -232,34 +232,6 @@ tabla1_resumen <- map_dfr(vars_tabla1_cat,
 
 cat("\n=== TABLA 1 (% por fila ponderado + N) ===\n")
 print(tabla1_resumen, n = Inf)
-
-# 2.d Versión gtsummary -------------------
-#   tbl_svysummary con percent="row": cada celda muestra el % de la categoría
-#   que cae en esa columna (Sin exceso / Exceso). add_n() agrega el N total.
-#   SIN add_p() -> sin warnings y sin columna de p-valores.
-diseno_t1 <- svydesign(
-  ids = ~1, strata = ~Estrato, weights = ~Ponderador,
-  data = datos_cat %>%
-    mutate(Target_lab = factor(
-      ifelse(Target_bin == 1, "Exceso de peso", "Sin exceso de peso"),
-      levels = c("Sin exceso de peso", "Exceso de peso"))),
-  nest = TRUE)
-
-tabla1 <- tbl_svysummary(
-  diseno_t1,
-  by = Target_lab,
-  include = all_of(vars_tabla1_cat),
-  #label = etiquetas,
-  statistic = all_categorical() ~ "{p}%",   # solo el porcentaje
-  percent = "row",                           # porcentajes POR FILA
-  digits = all_categorical() ~ 1,
-  missing = "no"
-) %>%
-  add_n(col_label = "**Total**") %>%          # N total por categoría
-  modify_header(label ~ "**Categoría**") %>%
-  modify_spanning_header(all_stat_cols() ~ "**Exceso de peso**") %>%
-  bold_labels()
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # COEFICIENTE V DE CRAMÉR PONDERADO
@@ -284,9 +256,7 @@ cramer_v_ponderado <- function(var, design) {
 vars_cramer <- c(
   "Region", "Sexo", "Edad_f",
   vars_fca,
-  "Sedentarismo_t", "ActFisica_t", "Sueno_t",
-  "Cumple_OMS_ActFisica", "Cumple_OMS_Sueño",
-  "Hace_ActFisica_Escuela", "Escuela_Provee_Alimento", "Escuela_Tiene_Kiosco",
+  "Sedentarismo_t", "ActFisica_t", "Cumple_OMS_ActFisica", "Hace_ActFisica_Escuela", "Escuela_Provee_Alimento", "Escuela_Tiene_Kiosco",
   "Compro_En_Kiosco", "Kiosco_Compro_No_Recomendados", "Kiosco_Compro_Recomendados",
   "Asiste_Escuela", "Cobertura_Salud", "Nivel_Educacion_Jefe", "Quintil_Ingreso",
   "Tipo_Vivienda", "Indice_Hacinamiento", "Indice_NBI", "Indice_NSE",
@@ -306,15 +276,29 @@ print(cramer_tab, n = Inf)
 
 # 3.d Figura: barras horizontales ordenadas -------------------
 fig_cramer <- cramer_tab %>%
-  mutate(variable = fct_reorder(variable, cramer_v)) %>%
+  mutate(
+    #variable = gsub("_", " ", variable),              # nombres mas legibles
+    variable = fct_reorder(variable, cramer_v)
+  ) %>%
   ggplot(aes(x = variable, y = cramer_v)) +
-  geom_col(fill = "#2c7fb8") +
-  geom_text(aes(label = sprintf("%.3f", cramer_v)), hjust = -0.15, size = 3) +
+  geom_col(fill = "#2c7fb8", width = 0.75) +
+  geom_text(aes(label = sprintf("%.3f", cramer_v)),
+            hjust = -0.15, size = 3.4, color = "gray25") +
   coord_flip() +
-  labs(title = "Coeficiente de Cramer’s V",
-       x = NULL, y = "Cramér's V (asociación)") +
-  ylim(0, max(cramer_tab$cramer_v) * 1.15) +
-  theme_minimal(base_size = 11)
+  scale_y_continuous(
+    limits = c(0, max(cramer_tab$cramer_v) * 1.18),
+    expand = expansion(mult = c(0, 0.02))
+  ) +
+  labs(title = "Coeficiente V de Cram\u00e9r ponderado",
+       x = NULL, y = "V de Cram\u00e9r (asociaci\u00f3n)") +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title         = element_text(face = "bold", hjust = 0.5),
+    axis.text.y        = element_text(size = 10),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor   = element_blank(),
+    plot.margin        = margin(t = 8, r = 14, b = 8, l = 8)
+  )
 
 print(fig_cramer)
 
@@ -411,7 +395,7 @@ fig_prev <- prev_all %>%
 
 print(fig_prev)
 
-#   Sub-figura: prevalencia por edad y sexo (la más relevante)
+#   Sub-figura: prevalencia por edad y sexo
 fig_prev_edad_sexo <- prev_all %>%
   filter(variable %in% c("Edad_f", "Sexo")) %>%
   mutate(variable = recode(variable, Edad_f = "Edad", Sexo = "Sexo")) %>%
