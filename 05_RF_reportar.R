@@ -67,6 +67,8 @@ df_modelo <- df %>%
   select(-y_bin) %>%
   filter(!is.na(Target_bin))
 
+as.factor(df_modelo$Edad)
+
 cat("Desenlace:", target_elegido, "\n")
 cat("Distribución del target:\n")
 print(prop.table(table(df_modelo$Target_bin)))
@@ -86,7 +88,7 @@ receta <- recipe(Target_bin ~ ., data = df_modelo) %>%
 p <- ncol(df_modelo) - 1
 cat("\nPredictores:", p, "| sqrt(p):", round(sqrt(p)), "\n")
 
-rf_spec <- rand_forest(mtry = tune(), trees = 500, min_n = tune()) %>%
+rf_spec <- rand_forest(mtry = tune(), trees = tune(), min_n = tune()) %>%
   set_engine("ranger", importance = "permutation", seed = 1213) %>%
   set_mode("classification")
 
@@ -97,15 +99,18 @@ set.seed(1213)
 folds_rf <- vfold_cv(df_modelo, v = 10, strata = Target_bin)
 
 # ── 5. GRID DE HIPERPARÁMETROS ──────────────────────────────
-# Con 6 predictoras, mtry no puede pasar de 6 → rango 2–5.
-n_pred <- ncol(df_modelo) - 1
+n_pred <- ncol(df_modelo) - 1   
 
-rf_grid <- grid_regular(
-  mtry(range  = c(2, max(2, n_pred - 1))),
-  min_n(range = c(5, 40)),
-  levels = 4
+trees_grid <- c(30, 50, 100, 200)   
+mtry_grid  <- c(1, 2, 3, 4, 6, 8)  
+min_n_grid <- c(100, 150, 250, 300, 350)   
+
+rf_grid <- tidyr::crossing(
+  trees = trees_grid,
+  mtry  = mtry_grid,
+  min_n = min_n_grid
 )
-cat("Combinaciones a explorar:", nrow(rf_grid), "\n")
+cat("Combinaciones a explorar:", nrow(rf_grid), "\n")   # 4*4*4 = 64
 
 # ── 6. GRID SEARCH ──────────────────────────────────────────
 cat("\nEntrenando grid search...\n")
@@ -120,15 +125,19 @@ rf_tune <- tune_grid(
 )
 
 # ── 7. MEJORES HIPERPARÁMETROS ──────────────────────────────
-cat("\n--- Top combinaciones por AUC ---\n")
-show_best(rf_tune, metric = "roc_auc", n = 8) %>% print()
+metrica_sel <- "roc_auc"
+
+cat("\n--- Top combinaciones por", metrica_sel, "---\n")
+show_best(rf_tune, metric = metrica_sel, n = 8) %>% print()
 
 autoplot(rf_tune, metric = "roc_auc") +
   labs(title = "AUC según hiperparámetros (CV 10 folds)") +
   theme_minimal(base_size = 12)
 
-mejor_params <- select_best(rf_tune, metric = "roc_auc")
-cat("\nMejores hiperparámetros:\n"); print(mejor_params)
+k <- 1
+mejor_params <- show_best(rf_tune, metric = metrica_sel, n = 10) %>%
+  slice(k) %>% select(mtry, trees, min_n, .config)
+cat("\nMejores hiperparámetros (", metrica_sel, "):\n", sep = ""); print(mejor_params)
 
 # ── 8. AUC CV GLOBAL (OOF) ──────────────────────────────────
 pred_cv_rf <- collect_predictions(rf_tune, parameters = mejor_params)
@@ -193,53 +202,124 @@ p_imp <- ggplot(imp_df, aes(x = Importance, y = Variable, fill = grupo)) +
         panel.grid.major.y = element_blank(),
         panel.grid.minor = element_blank())
 print(p_imp)
+#ggsave("importancia_rf.pdf", plot = p_imp, width = 9, height = 5)
 
-# ── 11. UMBRAL ÓPTIMO (Youden) Y MÉTRICAS ───────────────────
-youden_rf <- coords(roc_cv_rf, x = "best", best.method = "youden",
-                    ret = c("threshold", "sensitivity", "specificity"))
-cat("\n--- Umbral óptimo de Youden (RF, CV) ---\n"); print(youden_rf)
+# ── 11. UMBRALES Y MÉTRICAS (OOF) ───────────────────────────
+metricas_en_umbral <- function(prob_si, obs, umbral) {
+  pred <- ifelse(prob_si >= umbral, "Si", "No")
+  obs  <- as.character(obs)
+  vp <- sum(pred == "Si" & obs == "Si"); fp <- sum(pred == "Si" & obs == "No")
+  fn <- sum(pred == "No" & obs == "Si"); vn <- sum(pred == "No" & obs == "No")
+  sens <- vp / (vp + fn)
+  esp  <- vn / (vn + fp)
+  prec <- if ((vp + fp) > 0) vp / (vp + fp) else NA_real_
+  acc  <- (vp + vn) / (vp + fp + fn + vn)
+  f2   <- if (!is.na(prec) && (4 * prec + sens) > 0)
+    5 * prec * sens / (4 * prec + sens) else NA_real_   # F-beta con beta=2
+  c(accuracy = acc, sensibilidad = sens, precision = prec,
+    especificidad = esp, F2 = f2)
+}
 
-umbral <- 0.28  
+# (a) Umbral de Youden (referencia)
+umbral_youden <- as.numeric(
+  coords(roc_cv_rf, x = "best", best.method = "youden",
+         ret = "threshold", transpose = FALSE)$threshold
+)
 
-pred_binaria <- ifelse(pred_cv_rf$.pred_Si >= umbral, "Si", "No")
-obs_real     <- as.character(pred_cv_rf$Target_bin)
+# (b) Umbral ADOPTADO: mayor umbral con sensibilidad >= 0.8
+target_sens <- 0.80
+co   <- coords(roc_cv_rf, x = "all",
+               ret = c("threshold", "sensitivity", "specificity"),
+               transpose = FALSE)
+cand <- co[co$sensitivity >= target_sens & is.finite(co$threshold), ]
+umbral_sens <- max(cand$threshold)
 
-vp <- sum(pred_binaria == "Si" & obs_real == "Si")
-fp <- sum(pred_binaria == "Si" & obs_real == "No")
-fn <- sum(pred_binaria == "No" & obs_real == "Si")
-vn <- sum(pred_binaria == "No" & obs_real == "No")  
+cat(sprintf("\nUmbral Youden (referencia):     %.3f\n", umbral_youden))
 
-precision     <- vp / (vp + fp)
-recall        <- vp / (vp + fn)
-especificidad <- vn / (vn + fp)
-beta <- 2
-f2 <- (1 + beta^2) * precision * recall / ((beta^2 * precision) + recall)
+# Comparación de los dos umbrales
+cat("\n=== Comparación de umbrales (OOF, CV 10) — RF ===\n")
+comp_umbrales <- rbind(
+  Youden           = c(umbral = umbral_youden,
+                       metricas_en_umbral(pred_cv_rf$.pred_Si, pred_cv_rf$Target_bin, umbral_youden)),
+  Adoptado_sens80  = c(umbral = umbral_sens,
+                       metricas_en_umbral(pred_cv_rf$.pred_Si, pred_cv_rf$Target_bin, umbral_sens))
+)
+print(round(comp_umbrales, 4))
 
-cat("\n========================================\n")
-cat("MÉTRICAS EN EL UMBRAL (RF)\n")
-cat("========================================\n")
-cat(sprintf("Umbral:        %.3f\n", umbral))
-cat(sprintf("Sensibilidad:  %.4f\n", recall))
-cat(sprintf("Especificidad: %.4f\n", especificidad))
-cat(sprintf("F2-score:      %.4f\n", f2))
-cat("========================================\n")
+# ── 12. MÉTRICAS POR FOLD: ENTRENAMIENTO vs Evaluación + BOXPLOTS ──
+umbral_reporte <- umbral_sens
 
-# ── 12. CURVA ROC ───────────────────────────────────────────
-p_roc <- ggplot(data.frame(fpr = 1 - roc_cv_rf$specificities,
-                           tpr = roc_cv_rf$sensitivities),
-                aes(x = fpr, y = tpr)) +
-  geom_abline(slope = 1, intercept = 0, linetype = "dashed",
-              color = "gray60", linewidth = 0.5) +
-  geom_line(color = "#185FA5", linewidth = 1) +
-  annotate("text", x = 0.65, y = 0.25,
-           label = sprintf("AUC CV = %.3f", auc_cv_rf),
-           size = 4, color = "#185FA5", fontface = "bold") +
-  scale_x_continuous("1 \u2212 Especificidad", limits = c(0, 1), expand = c(0.01, 0)) +
-  scale_y_continuous("Sensibilidad", limits = c(0, 1), expand = c(0.01, 0)) +
-  labs(title    = "Curva ROC \u2014 Random Forest (CV 10 folds)",
-       subtitle = "Predicciones out-of-fold del mejor modelo") +
+eval_fold <- function(split) {
+  tr <- analysis(split); te <- assessment(split)
+  mod <- fit(wf_final, data = tr)   # la receta se re-prepara solo con tr (sin leakage)
+  
+  prob_tr <- predict(mod, tr, type = "prob")$.pred_Si
+  prob_te <- predict(mod, te, type = "prob")$.pred_Si
+  
+  auc_tr <- as.numeric(auc(roc(tr$Target_bin, prob_tr,
+                               levels = c("No","Si"), direction = "<", quiet = TRUE)))
+  auc_te <- as.numeric(auc(roc(te$Target_bin, prob_te,
+                               levels = c("No","Si"), direction = "<", quiet = TRUE)))
+  
+  m_tr <- metricas_en_umbral(prob_tr, tr$Target_bin, umbral_reporte)
+  m_te <- metricas_en_umbral(prob_te, te$Target_bin, umbral_reporte)
+  
+  bind_rows(
+    tibble(particion = "Entrenamiento", metrica = c(names(m_tr), "AUC"),
+           valor = c(as.numeric(m_tr), auc_tr)),
+    tibble(particion = "Evaluación",        metrica = c(names(m_te), "AUC"),
+           valor = c(as.numeric(m_te), auc_te))
+  )
+}
+
+set.seed(1213)
+metricas_folds <- folds_rf$splits %>%
+  set_names(folds_rf$id) %>%
+  imap(~ eval_fold(.x) %>% mutate(fold = .y)) %>%
+  bind_rows()
+
+# Resumen media ± sd (train vs test)
+resumen_ft <- metricas_folds %>%
+  group_by(particion, metrica) %>%
+  summarise(media = mean(valor, na.rm = TRUE),
+            sd    = sd(valor,   na.rm = TRUE), .groups = "drop") %>%
+  arrange(metrica, particion)
+cat("\n--- Métricas por fold: media ± sd (train vs test) — RF ---\n")
+print(resumen_ft, n = Inf)
+
+# ── Boxplots: eje de IGUAL ALTO por panel (idéntico a RegLog) ──
+orden_m <- c("sensibilidad","precision","F2","accuracy","AUC","especificidad")
+metricas_folds <- metricas_folds %>% mutate(metrica = factor(metrica, levels = orden_m))
+
+# Alto común = el mayor rango entre métricas, con 15% de margen
+span <- metricas_folds %>%
+  group_by(metrica) %>%
+  summarise(r = max(valor) - min(valor), .groups = "drop") %>%
+  pull(r) %>% max() * 1.15
+
+lims <- metricas_folds %>%
+  group_by(metrica) %>%
+  summarise(centro = (min(valor) + max(valor)) / 2, .groups = "drop") %>%
+  mutate(lo = pmax(0, centro - span/2), hi = pmin(1, centro + span/2)) %>%
+  pivot_longer(c(lo, hi), values_to = "valor") %>%
+  transmute(metrica, particion = "Entrenamiento", valor)
+
+p_box <- metricas_folds %>%
+  filter(metrica %in% orden_m) %>%
+  ggplot(aes(x = particion, y = valor, fill = particion)) +
+  geom_boxplot(width = 0.6, alpha = 0.85, outlier.size = 0.8) +
+  geom_blank(data = lims) +
+  facet_wrap(~ metrica, nrow = 2, scales = "free_y") +
+  scale_fill_manual(values = c("Entrenamiento" = "#BA7517", "Evaluación" = "#185FA5")) +
+  labs(title = "Distribución de métricas por fold (CV 10) — Random Forest",
+       subtitle = sprintf("Umbral adoptado = %.3f (sens >= %.2f)", umbral_reporte, target_sens),
+       x = NULL, y = NULL) +
   theme_minimal(base_size = 12) +
-  theme(plot.title = element_text(face = "bold", size = 13, hjust = 0.5),
-        plot.subtitle = element_text(color = "gray40", size = 10, hjust = 0.5),
-        panel.grid.minor = element_blank())
-print(p_roc)
+  theme(legend.position    = "none",
+        plot.title         = element_text(face = "bold", hjust = 0.5),
+        plot.subtitle      = element_text(color = "gray40", hjust = 0.5),
+        strip.text         = element_text(face = "bold"),
+        panel.grid.minor.y = element_line(linewidth = 0.3, color = "gray92"))
+print(p_box)
+
+#ggsave("boxplot_rf.pdf", plot = p_box, width = 9, height = 5)
