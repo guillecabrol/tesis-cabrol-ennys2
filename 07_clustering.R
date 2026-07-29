@@ -41,7 +41,7 @@ print(summary(df[vars_dieta]))
 # ----- 1.3 Estado_Peso: 3 categorías ordenadas (solo para caracterización) -----
 df$Estado_Peso <- factor(
   dplyr::case_when(
-    df$Cat_IMC %in% c("Peso normal", "Delgadez") ~ "Sin exceso de peso",
+    df$Cat_IMC %in% c("Peso normal") ~ "Sin exceso de peso",
     df$Cat_IMC == "Sobrepeso"                     ~ "Sobrepeso",
     df$Cat_IMC == "Obesidad"                      ~ "Obesidad"
   ),
@@ -66,29 +66,29 @@ a_terciles <- function(x) {
 }
 df$Sedentarismo_t <- a_terciles(df$HorasPorDia_Sedentarismo)
 df$ActFisica_t    <- a_terciles(df$Horas_PorDia_ActFisica)
-df$Sueño_t        <- a_terciles(df$HorasPorDia_Sueño)
 
 # ----- 1.5 Subconjunto activo: 3 frecuencias + 3 terciles -----
 vars_activas <- c(vars_dieta, "Sedentarismo_t", "ActFisica_t")
 df_clust <- df[, c("id", vars_activas)]
 
 # ----- 2. Gower -----
-# Las 3 frecuencias son numéricas acotadas (1-3, sin outliers) → intervalares;
-# los 3 terciles conductuales, ordinales. Cada variable aporta 1/6 a la
-# distancia → dieta 3/6, comportamiento 3/6 (dominios balanceados).
 tipos <- list(ordratio = c("Sedentarismo_t", "ActFisica_t"))
 gower_dist <- daisy(df_clust[, vars_activas], metric = "gower", type = tipos)
 
 # ============================================================================
-# 3. NÚMERO ÓPTIMO DE CLUSTERS (silueta sobre PAM, k = 2..8)
+# 3. NÚMERO ÓPTIMO DE CLUSTERS (silueta y codo sobre PAM, k = 2..8)
 # ============================================================================
-k_range <- 2:8
+k_range <- 2:10
 sil_widths <- numeric(length(k_range))
-cat("\n--- Silueta promedio por k ---\n")
+wss_widths  <- numeric(length(k_range))   # suma de disimilaridades intra-cluster (codo)
+cat("\n--- Silueta y costo (WSS) por k ---\n")
 for (i in seq_along(k_range)) {
   pam_fit <- pam(gower_dist, k = k_range[i], diss = TRUE)
   sil_widths[i] <- pam_fit$silinfo$avg.width
-  cat("  k =", k_range[i], ": silueta =", round(sil_widths[i], 4), "\n")
+  wss_widths[i] <- pam_fit$objective["swap"]   # costo tras optimización = Σ disim. al medoide
+  cat("  k =", k_range[i],
+      ": silueta =", round(sil_widths[i], 3),
+      "| codo =",    round(wss_widths[i], 3), "\n")
 }
 
 df_sil <- data.frame(k = k_range, sil = sil_widths)
@@ -97,12 +97,28 @@ p_sil <- ggplot(df_sil, aes(k, sil)) +
   geom_point(size = 3, color = "steelblue") +
   geom_text(aes(label = round(sil, 3)), vjust = -1, size = 3.5) +
   scale_x_continuous(breaks = k_range) +
-  labs(title = "Silueta promedio vs k (PAM + Gower)",
+  scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.1)) + 
+  labs(title = "Silueta promedio vs k (PAM + dist. Gower)",
        x = "Número de clusters (k)", y = "Ancho de silueta promedio") +
   theme_minimal(base_size = 12)
 print(p_sil)
+#ggsave("silueta.pdf", plot = p_sil, width = 9, height = 5)
 
-k_opt <- 3
+# --- Método del codo (suma de disimilaridades intra-cluster) ---
+df_wss <- data.frame(k = k_range, wss = wss_widths)
+p_wss <- ggplot(df_wss, aes(k, wss)) +
+  geom_line(color = "#C0392B", linewidth = 1) +
+  geom_point(size = 3, color = "#C0392B") +
+  scale_x_continuous(breaks = k_range) +
+  scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.1)) + 
+  labs(title = "Método del codo (PAM + dist. Gower)",
+       #subtitle = "Buscar el k donde la curva deja de bajar abruptamente",
+       x = "Número de clusters (k)", y = "Suma de disimilaridades intra-cluster") +
+  theme_minimal(base_size = 12)
+print(p_wss)
+#ggsave("codo.pdf", p_wss, width = 7, height = 5)
+
+k_opt <- 5
 cat("\n>>> k elegido:", k_opt, "<<<\n")
 
 # ============================================================================
@@ -120,19 +136,15 @@ cat("\nTamaños de cluster:\n");      print(table(df_clust$cluster))
 cat("\nProporciones:\n");            print(round(prop.table(table(df_clust$cluster)), 3))
 cat("\n--- Medoides ---\n");         print(df_clust[pam_final$id.med, ])
 
-sil_final <- silhouette(pam_final$clustering, gower_dist)
-print(fviz_silhouette(sil_final, palette = "jco") +
-        labs(title = paste("Silueta por individuo — PAM k =", k_final)))
-
 # ============================================================================
 # 5. TABLA ÚNICA DE CARACTERIZACIÓN POR CLUSTER (arsenal::tableby)
 # ============================================================================
-# install.packages("arsenal")
 library(arsenal)
 
 # --- 5.0 Preparar variables para la tabla --------------------------------
 df$ind_obesidad <- as.integer(df$Cat_IMC == "Obesidad")
 df$ind_exceso   <- as.integer(df$Cat_IMC %in% c("Sobrepeso", "Obesidad"))
+df$ind_sobrepeso <- as.integer(df$Cat_IMC == "Sobrepeso")
 
 # Limpiar "NS/NC" del entorno escolar
 vars_a_limpiar <- c("Hace_ActFisica_Escuela", "Escuela_Tiene_Kiosco",
@@ -185,12 +197,12 @@ print(summary(tab_activas, labelTranslations = labels_activas, text = TRUE))
 # BLOQUE B — CARACTERIZACIÓN (variables externas al armado)                          
 # --------------------------------------------------------------------------------------------
 labels_caract <- list(
+  Z_IMC = "IMC para edad",
   Estado_Peso_tab          = "Estado nutricional",
   Edad                     = "Edad (años)",
   Quintil_Ingreso_f        = "Quintil de ingreso",
   Sexo                     = "Sexo",
   Region                   = "Región",
-  HorasPorDia_Sueño        = "Sueño (h/día)",
   Cobertura_Salud          = "Cobertura de salud",
   Nivel_Educacion_Jefe     = "Educación del jefe/a",
   Indice_NSE               = "NSE",
@@ -203,7 +215,7 @@ labels_caract <- list(
 )
 
 tab_caract <- tableby(
-  cluster ~ Estado_Peso_tab + Edad + Quintil_Ingreso_f + Sexo + Region  + HorasPorDia_Sueño +
+  cluster ~ Z_IMC + Estado_Peso_tab + Edad + Quintil_Ingreso_f + Sexo + Region +
     Cobertura_Salud + Nivel_Educacion_Jefe + Indice_NSE + Indice_NBI +
     Indice_Hacinamiento_tab + Indice_Material_Cat + Asiste_Escuela_tab +
     Escuela_Provee_Alimento + Indice_Obesogenico_Cat,
@@ -224,6 +236,7 @@ diseno <- svydesign(ids = ~1, strata = ~Estrato, weights = ~Ponderador,
 
 prev_ob <- svyby(~ind_obesidad, ~cluster, diseno, svyciprop, vartype = "ci", method = "logit")
 prev_ex <- svyby(~ind_exceso,  ~cluster, diseno, svyciprop, vartype = "ci", method = "logit")
+prev_sp <- svyby(~ind_sobrepeso, ~cluster, diseno, svyciprop, vartype = "ci", method = "logit")
 
 prev_cluster <- tibble(
   cluster  = prev_ob$cluster,
@@ -232,7 +245,10 @@ prev_cluster <- tibble(
   ob_hi    = round(100 * prev_ob$ci_u, 1),
   exceso   = round(100 * prev_ex$ind_exceso, 1),
   ex_lo    = round(100 * prev_ex$ci_l, 1),
-  ex_hi    = round(100 * prev_ex$ci_u, 1)
+  ex_hi    = round(100 * prev_ex$ci_u, 1),
+  sobrepeso = round(100 * prev_sp$ind_sobrepeso, 1),
+  sp_lo     = round(100 * prev_sp$ci_l, 1),
+  sp_hi     = round(100 * prev_sp$ci_u, 1),
 )
 cat("\n--- Prevalencia ponderada de peso por cluster (IC95%) ---\n")
 print(prev_cluster)
@@ -248,13 +264,13 @@ ex_global <- 100 * as.numeric(svyciprop(~ind_exceso,   diseno, method = "logit")
 d_prev <- bind_rows(
   prev_cluster %>% transmute(cluster, medida = "Obesidad",
                              pct = obesidad, lo = ob_lo, hi = ob_hi),
-  prev_cluster %>% transmute(cluster, medida = "Exceso de peso",
-                             pct = exceso, lo = ex_lo, hi = ex_hi)
+  prev_cluster %>% transmute(cluster, medida = "Sobrepeso",
+                             pct = sobrepeso, lo = sp_lo, hi = sp_hi)
 ) %>%
-  mutate(medida = factor(medida, levels = c("Obesidad", "Exceso de peso")))
+  mutate(medida = factor(medida, levels = c("Obesidad", "Sobrepeso")))
 
-d_lineas <- data.frame(medida = factor(c("Obesidad", "Exceso de peso"),
-                                       levels = c("Obesidad", "Exceso de peso")),
+d_lineas <- data.frame(medida = factor(c("Obesidad", "Sobrepeso"),
+                                       levels = c("Obesidad", "Sobrepeso")),
                        global = c(ob_global, ex_global))
 
 p_g1 <- ggplot(d_prev, aes(cluster, pct, fill = cluster)) +
@@ -264,15 +280,16 @@ p_g1 <- ggplot(d_prev, aes(cluster, pct, fill = cluster)) +
   # geom_hline(data = d_lineas, aes(yintercept = global),
   #            linetype = "dashed", color = "red") +
   facet_wrap(~medida) +
-  labs(title = "Prevalencia ponderada de obesidad y exceso de peso por cluster",
+  labs(title = "Prevalencia ponderada de obesidad y sobrepeso por cluster",
        #subtitle = "IC95% (método logit) | línea punteada: prevalencia global",
        x = "Cluster", y = "%") +
   theme_minimal(base_size = 12) +
   theme(legend.position = "none", strip.text = element_text(face = "bold"))
 print(p_g1)
+#ggsave("prevalencia_clusters.pdf", plot = p_g1, width = 9, height = 5)
 
 # ── G2. Perfil conductual: % en cada tercil por cluster (variables activas) ─
-# (No ponderado: describe la partición en sus propias variables)
+# (No ponderado)
 perfil_terc <- df %>%
   pivot_longer(c(Sedentarismo_t, ActFisica_t),
                names_to = "variable", values_to = "nivel") %>%
@@ -298,7 +315,6 @@ p_g2 <- ggplot(perfil_terc, aes(cluster, nivel, fill = pct)) +
 print(p_g2)
 
 # ── G2b. Perfil alimentario: % "Consumo diario" de cada frecuencia por cluster ─
-# (Las 3 frecuencias también son activas: este gráfico las describe.)
 perfil_dieta <- df %>%
   transmute(cluster,
             Frutas    = Frec_Frutas,
@@ -370,7 +386,6 @@ p_g3 <- ggplot(d_g3, aes(cluster, categoria, fill = pct)) +
 print(p_g3)
 
 # ── G4. Entorno escolar por cluster (ponderado) ─────────────────────────────
-# Reutiliza comp_long() definida en el bloque G3.
 vars_g4 <- c("Asiste_Escuela", "Escuela_Provee_Alimento", "Escuela_Tiene_Kiosco",
              "Compro_En_Kiosco", "Kiosco_Compro_No_Recomendados",
              "Hace_ActFisica_Escuela", "Indice_Obesogenico_Cat")
